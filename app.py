@@ -1,23 +1,21 @@
 """
-app.py MVP v8
-Фиксы:
-  - NLU: _JUNK не трогает цифры и проценты, чистит только стоп-слова
-  - NLU: qty извлекается ДО очистки JUNK, чтобы не путать "3,2%" с количеством
-  - NLU: поисковый запрос = очищенный текст БЕЗ qty-слов и мусора
-  - Whisper: no_speech_prob порог — галлюцинации отбрасываются
-  - Whisper: log_prob_threshold для фильтрации тихих артефактов
+app.py MVP v10 - АК-47 Франкенштейн ИИ
+Три механизма защиты:
+1. Initial Prompt с топ-50 товаров
+2. Hotwords из MCP (топ-100)
+3. Fuzzy-поиск по всему каталогу (rapidfuzz)
 """
 import asyncio, json, os, queue, re, tempfile, threading, time
 from typing import Dict, List, Optional
 
 import numpy as np
-import pygame
 import sounddevice as sd
 import edge_tts
 from faster_whisper import WhisperModel
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import uvicorn
+from rapidfuzz import fuzz, process
 
 from mcp_client import VkusVillMCP
 
@@ -29,8 +27,21 @@ MIN_SAMPLES    = 16000
 POST_TTS_PAUSE = 0.5
 MAX_ITEMS      = 5
 MAX_ERRORS     = 2
-STT_MODEL      = "small"
+
+STT_MODEL = "deepdml/faster-whisper-large-v3-turbo-ct2"
 TTS_VOICE      = "ru-RU-SvetlanaNeural"
+
+# Топ-50 популярных товаров (hardcoded для initial prompt)
+POPULAR_ITEMS = [
+    "молоко", "кефир", "творог", "сметана", "йогурт", "ряженка",
+    "сыр", "масло сливочное", "масло оливковое", "сёмга", "форель",
+    "курица", "говядина", "картофель", "помидоры", "огурцы",
+    "хлеб", "батон", "пельмени", "вареники", "колбаса", "сосиски",
+    "яйца", "гречка", "рис", "макароны", "печенье", "конфеты",
+    "чай", "кофе", "сок", "вода", "лимонад", "квас", "пиво",
+    "чипсы", "сухарики", "орешки", "бананы", "яблоки", "груши",
+    "апельсины", "мандарины", "виноград", "клубника", "малина"
+]
 
 SILENT_NEEDED  = int(SILENCE_SEC / (512 / SAMPLE_RATE))
 
@@ -38,7 +49,15 @@ def ts():   return time.strftime("%H:%M:%S")
 def log(m): print(f"[{ts()}] {m}", flush=True)
 
 # ── TTS ──────────────────────────────────────────
-pygame.mixer.init()
+try:
+    import pygame
+    pygame.mixer.init()
+except ImportError:
+    log("⚠️ pygame не установлен, TTS будет без звука")
+    class MockPygame:
+        mixer = type('obj', (object,), {'init': lambda: None, 'music': type('obj', (object,), {'load': lambda x: None, 'play': lambda: None, 'unload': lambda: None, 'get_busy': lambda: False})()})()
+    pygame = MockPygame()
+
 is_speaking  = False
 _mic_blocked = False
 _tts_done    = threading.Event()
@@ -93,6 +112,10 @@ class Session:
         self.status     = "⏸ Ожидание"
         self.basket_url = ""
         self.pending: Optional[Dict] = None
+        self.pending_items: Optional[List[Dict]] = None
+        self.pending_query: Optional[str] = None
+        self.catalog: List[str] = []  # кэш названий товаров для fuzzy
+        self.hotwords: List[str] = []  # топ-100 для hotwords
     def __init__(self): self.reset()
 
 S   = Session()
@@ -117,14 +140,22 @@ def say(text: str, wait: bool = False):
     if wait:
         _tts_done.wait()
 
-# ── NLU (переписан) ──────────────────────────────
+# ── ИНИЦИАЛИЗАЦИЯ КАТАЛОГА ───────────────────────
+async def init_catalog():
+    """Загружает каталог товаров и топ-100 для hotwords"""
+    log("📚 Загружаю популярные товары для fuzzy-поиска...")
+    # Пока используем hardcoded список, так как MCP не умеет в пустой запрос
+    S.catalog = POPULAR_ITEMS.copy()
+    S.hotwords = [item[:20] for item in POPULAR_ITEMS[:50]]
+    log(f"✅ Загружено {len(S.catalog)} товаров, {len(S.hotwords)} hotwords (hardcoded)")
+
+# ── NLU (улучшенная) ─────────────────────────────
 _CONFIRM = re.compile(r'\b(да|верно|правильно|ок|окей|хорошо|подтверждаю|конечно|именно|точно|угу|ага)\b', re.I)
 _DONE    = re.compile(r'\b(всё|все|хватит|достаточно|готово|оформляй|оформите|заканчивай|больше ничего)\b', re.I)
 _OP      = re.compile(r'\b(оператор|человек|живой|менеджер|помогите|соедини|переключи|стоп)\b', re.I)
 _DENY    = re.compile(r'\b(нет|не верно|неверно|не то|другой|другое|не тот|не та)\b', re.I)
-_ADD     = re.compile(r'\b(добавь|добавьте|положи|хочу|дай|нужно|нужен|нужна|нужны|купи|возьми|закажи|добавить)\b', re.I)
+_SELECT  = re.compile(r'\b(первый|второй|третий|1-й|2-й|3-й|1|2|3)\b', re.I)
 
-# слова-количества прописью
 _QTY_WORDS = {
     "один": 1, "одну": 1, "одна": 1,
     "два": 2, "две": 2,
@@ -133,54 +164,67 @@ _QTY_WORDS = {
     "девять": 9, "десять": 10,
 }
 
-# слова которые точно не часть названия товара
-# ВАЖНО: не трогаем цифры, проценты, граммовку — они нужны для поиска
 _STOP_WORDS = re.compile(
     r'\b(мне|пожалуйста|ещё|еще|можно|просто|купи|возьми|закажи|'
     r'положи|добавь|добавьте|добавить|хочу|дай|нужно|нужен|нужна|нужны)\b',
     re.I
 )
 
-# единицы измерения — оставляем в запросе, они помогают поиску!
-# убираем только явные контейнеры без числа перед ними
-_CONTAINERS = re.compile(r'\b(упаковку|упаковка|штуку|штук|пачку|пачка|бутылку|бутылка|пакет|пакете)\b', re.I)
-
+def fuzzy_fix(query: str) -> str:
+    """Находит ближайшее название товара в каталоге (АК-47 деталь №3)"""
+    if not query or len(query) < 3 or not S.catalog:
+        return query
+    
+    # Ищем с порогом 70%
+    result = process.extractOne(query, S.catalog, scorer=fuzz.ratio, score_cutoff=70)
+    if result:
+        fixed, score = result
+        if score > 80:
+            log(f"   🔧 Fuzzy замена: '{query}' → '{fixed}' (сходство {score}%)")
+            return fixed
+    return query
 
 def _extract_qty_and_clean(text: str):
-    """
-    Извлекает количество и возвращает (qty, clean_text).
-    Количество = прописное слово ИЛИ одиночная цифра НЕ внутри "3,2%" / "1%" / "0.5".
-    """
     qty = 1
     result = text
-
-    # сначала пробуем прописные
     for word, n in _QTY_WORDS.items():
         if re.search(rf'\b{word}\b', result, re.I):
             result = re.sub(rf'\b{word}\b', '', result, flags=re.I)
             qty = n
             break
     else:
-        # ищем одиночную цифру 2-9 которая НЕ предшествует запятой/точке+цифра и НЕ после них
-        # т.е. НЕ внутри "3,2" или "0.5" или "1%"
         m = re.search(r'(?<![,.\d])([2-9])(?![,.\d%])', result)
         if m:
             qty = int(m.group(1))
             result = result[:m.start()] + result[m.end():]
-
     return qty, result.strip()
 
-
 def _build_search_query(text: str) -> str:
-    """Чистит текст для поиска: убирает команды и стоп-слова, сохраняет числа и характеристики."""
     q = _STOP_WORDS.sub(' ', text)
-    q = _CONTAINERS.sub(' ', q)
-    q = re.sub(r'\s+', ' ', q).strip()
-    # убираем одиночные буквы-остатки
-    q = re.sub(r'\b[а-яёa-z]\b', ' ', q, flags=re.I)
     q = re.sub(r'\s+', ' ', q).strip()
     return q
+    
+def normalize_query(query: str) -> str:
+    """Нормализует запрос перед отправкой в MCP"""
+    # 3,2% → 3.2% (MCP понимает точку, а не запятую)
+    query = re.sub(r'(\d+),(\d+%)', r'\1.\2', query)
+    # Убираем слово "жирности" (оно избыточно)
+    query = re.sub(r'\bжирности\b', '', query, flags=re.I)
+    # Убираем двойные пробелы
+    query = re.sub(r'\s+', ' ', query).strip()
+    return query
 
+def extract_select_index(text: str) -> Optional[int]:
+    m = _SELECT.search(text)
+    if m:
+        word = m.group(1).lower()
+        if word in ["первый", "1-й", "1"]:
+            return 0
+        if word in ["второй", "2-й", "2"]:
+            return 1
+        if word in ["третий", "3-й", "3"]:
+            return 2
+    return None
 
 def nlu(text: str) -> dict:
     t = text.strip()
@@ -190,14 +234,22 @@ def nlu(text: str) -> dict:
     if _CONFIRM.search(t): return {"intent": "confirm"}
     if _DENY.search(t):    return {"intent": "deny"}
 
-    # извлекаем qty и чистим
+    if S.pending_items:
+        idx = extract_select_index(t)
+        if idx is not None and idx < len(S.pending_items):
+            return {"intent": "select_item", "index": idx}
+
+    # АК-47: сначала fuzzy fix
+    t = fuzzy_fix(t)
+
     qty, cleaned = _extract_qty_and_clean(t)
     query = _build_search_query(cleaned)
 
     log(f"   NLU: raw={t!r} → qty={qty} query={query!r}")
 
     if len(query) >= 2:
-        return {"intent": "add_item", "product": query, "qty": qty}
+        is_single_word = len(query.split()) == 1
+        return {"intent": "add_item", "product": query, "qty": qty, "single_word": is_single_word}
     return {"intent": "unknown"}
 
 # ── АУДИО ────────────────────────────────────────
@@ -239,11 +291,16 @@ def audio_capture(stop_ev: threading.Event):
             time.sleep(0.05)
 
 # ── STT ──────────────────────────────────────────
-print("⏳ Загружаю Whisper...")
-_whisper = WhisperModel(STT_MODEL, device="cpu", compute_type="int8")
+print(f"⏳ Загружаю Whisper ({STT_MODEL})...")
+_whisper = WhisperModel(
+    STT_MODEL, 
+    device="cpu", 
+    compute_type="int8",
+    cpu_threads=8,
+    num_workers=2
+)
 print("✅ Whisper готов")
 
-# фразы-галлюцинации Whisper на тишине
 _HALLUCINATIONS = re.compile(
     r'^(спасибо|до свидания|пробки?|субтитры|подписывайтесь|продолжение следует'
     r'|в этом видео|редактирование|\.+|-+|\s*)$',
@@ -251,26 +308,32 @@ _HALLUCINATIONS = re.compile(
 )
 
 def transcribe(audio: np.ndarray) -> str:
+    # АК-47 деталь №1: initial prompt с топ-50 товаров
+    initial_prompt = f"Пользователь диктует список покупок в магазине. Товары: {', '.join(POPULAR_ITEMS[:30])}. Распознавай чётко названия продуктов."
+    
+    # АК-47 деталь №2: hotwords из MCP
+    hotwords_str = ", ".join(S.hotwords[:50]) if S.hotwords else ""
+    
     segs, info = _whisper.transcribe(
         audio,
         beam_size=1,
         language="ru",
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 500},
-        no_speech_threshold=0.6,      # отбрасываем если модель не уверена что есть речь
-        log_prob_threshold=-1.0,      # отбрасываем сегменты с низкой вероятностью
+        no_speech_threshold=0.6,
+        log_prob_threshold=-1.0,
         compression_ratio_threshold=2.4,
+        initial_prompt=initial_prompt,
+        hotwords=hotwords_str if hotwords_str else None
     )
     parts = []
     for seg in segs:
-        # фильтр по уверенности сегмента
         if seg.no_speech_prob > 0.6:
             log(f"   STT: сегмент отброшен (no_speech_prob={seg.no_speech_prob:.2f}): {seg.text!r}")
             continue
         parts.append(seg.text.strip())
     text = " ".join(parts).strip()
 
-    # фильтр галлюцинаций
     if _HALLUCINATIONS.match(text):
         log(f"   STT: галлюцинация отброшена: {text!r}")
         return ""
@@ -294,6 +357,21 @@ async def do_handoff(reason: str):
     items_str = ", ".join(i["name"] for i in S.cart) if S.cart else "корзина пуста"
     say(f"{reason} В корзине: {items_str}. Оператор всё видит.", wait=True)
     S.status = "✅ Оператор подключается"
+    push()
+
+async def show_top_choices(query: str, qty: int, results: List[Dict]):
+    top_items = results[:3]
+    S.pending_items = top_items
+    S.pending_query = query
+    
+    message = "Я нашёл несколько вариантов:\n"
+    for i, item in enumerate(top_items, 1):
+        price = item.get("price", {}).get("current", "?")
+        message += f"{i}. {item['name']} — {price} руб.\n"
+    message += "Какой добавить? Скажите «первый», «второй» или «третий»."
+    
+    say(message, wait=True)
+    S.status = "⏳ Жду выбора товара"
     push()
 
 # ── ГОЛОСОВОЙ ЦИКЛ ───────────────────────────────
@@ -330,11 +408,33 @@ async def voice_loop():
         log(f"🧠 {intent}")
         action = intent["intent"]
 
+        if S.pending_items and action == "select_item":
+            idx = intent["index"]
+            item = S.pending_items[idx]
+            price = item.get("price", {}).get("current", "?")
+            qty = 1
+            
+            S.cart.append({"xml_id": int(item["xml_id"]), "name": item["name"],
+                           "price": price, "qty": qty})
+            S.pending_items = None
+            S.pending_query = None
+            S.errors = 0
+            
+            if len(S.cart) >= MAX_ITEMS:
+                await do_handoff(f"Добавил {item['name']}. Набрали {MAX_ITEMS} позиций.")
+            else:
+                say(f"Добавил {item['name']}. {HINT_ADD} {HINT_DONE}", wait=True)
+                S.status = "🎤 Слушаю..."
+                push()
+            continue
+
         if S.pending:
             if action == "confirm":
                 item = S.pending
                 S.cart.append(item)
-                S.pending = None; S.errors = 0
+                S.pending = None
+                S.pending_items = None
+                S.errors = 0
                 if len(S.cart) >= MAX_ITEMS:
                     await do_handoff(f"Добавил {item['name']}. Набрали {MAX_ITEMS} позиций.")
                 else:
@@ -342,12 +442,16 @@ async def voice_loop():
                     S.status = "🎤 Слушаю..."; push()
                 continue
             if action == "deny":
-                S.pending = None; S.errors = 0
+                S.pending = None
+                S.pending_items = None
+                S.errors = 0
                 say(f"Хорошо, отменил. {HINT_ADD}", wait=True)
                 S.status = "🎤 Слушаю..."; push()
                 continue
             if action not in ("operator", "done"):
-                log("↩️ pending сброшен"); S.pending = None
+                log("↩️ pending сброшен")
+                S.pending = None
+                S.pending_items = None
 
         if action == "done":
             if not S.cart:
@@ -362,30 +466,43 @@ async def voice_loop():
             continue
 
         if action == "add_item":
-            q, qty = intent["product"], intent["qty"]
+            q, qty, is_single = intent["product"], intent["qty"], intent.get("single_word", False)
+            
+            # Нормализуем запрос перед отправкой
+            q_normalized = normalize_query(q)
+            if q_normalized != q:
+                log(f"   🔧 Нормализация: '{q}' → '{q_normalized}'")
+                q = q_normalized
+            
             S.status = f"🔍 Ищу «{q}»..."; push()
             log(f"🔍 MCP search: {q!r} qty={qty}")
             try:
                 results = await mcp.search(q)
             except Exception as e:
                 log(f"   MCP error: {e}"); results = []
+            
+            log(f"   MCP нашёл {len(results)} товаров")
 
             if not results:
                 S.errors += 1
                 if S.errors >= MAX_ERRORS:
                     await do_handoff("Не могу найти товары, передаю оператору.")
                 else:
-                    say(f"Не нашёл «{q}». Попробуйте назвать проще, например просто «молоко».", wait=True)
+                    say(f"Не нашёл «{q}». Попробуйте назвать проще.", wait=True)
                     S.status = "🎤 Слушаю..."; push()
                 continue
 
-            item  = results[0]
+            if is_single and len(results) > 1:
+                await show_top_choices(q, qty, results)
+                continue
+
+            item = results[0]
             price = item.get("price", {}).get("current", "?")
             S.pending = {"xml_id": int(item["xml_id"]), "name": item["name"],
                          "price": price, "qty": qty}
-            S.errors  = 0
-            S.status  = "⏳ Жду подтверждения"
-            say(f"Нашёл: {item['name']}, {price} рублей, {qty} штуки. Верно?", wait=True)
+            S.errors = 0
+            S.status = "⏳ Жду подтверждения"
+            say(f"Нашёл: {item['name']}, {price} рублей, {qty} штука. Верно?", wait=True)
             push()
             continue
 
@@ -399,7 +516,7 @@ async def voice_loop():
 # ── FASTAPI ──────────────────────────────────────
 app = FastAPI()
 
-HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Ассистент v8</title>
+HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Ассистент v10 - АК-47</title>
 <style>
 body{font-family:system-ui;max-width:960px;margin:0 auto;padding:1.5rem;background:#f0f2f5}
 .status{padding:10px 16px;border-radius:8px;background:#1565C0;color:#fff;font-weight:600;margin-bottom:1rem}
@@ -417,10 +534,11 @@ button{padding:10px 22px;font-size:14px;font-weight:600;border:none;border-radiu
 .empty{color:#bbb;font-style:italic;font-size:13px}
 .hint{background:#fff8e1;border-left:3px solid #f9a825;padding:10px 14px;border-radius:4px;font-size:13px;margin-bottom:1rem;line-height:1.8}
 </style></head><body>
-<h2>🎙 Ассистент v8</h2>
+<h2>🎙 Ассистент v10 — АК-47 Франкенштейн ИИ</h2>
 <div class="hint">
   <b>«да»</b> — подтвердить &nbsp;·&nbsp;
   <b>«нет»</b> — отменить &nbsp;·&nbsp;
+  <b>«первый/второй/третий»</b> — выбрать из предложенных &nbsp;·&nbsp;
   <b>«всё»</b> / <b>«готово»</b> — передать оператору &nbsp;·&nbsp;
   <b>«оператор»</b> — передать немедленно
 </div>
@@ -501,6 +619,9 @@ def _run_uvicorn():
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
 
 async def main():
+    # Загружаем каталог перед стартом
+    await init_catalog()
+    
     threading.Thread(target=_run_uvicorn, daemon=True).start()
     stop_ev = threading.Event()
     threading.Thread(target=audio_capture, args=(stop_ev,), daemon=True).start()
