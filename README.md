@@ -1,1 +1,100 @@
-Starter files for an assistant project that helps operators process phone orders. The assistant's role is to assemble a specific customer's shopping cart and transfer it to the operator for order completion or clarification of details. Business benefits: reduced line congestion, increased call-to-order conversion due to elimination of hold times, positive unit cost dynamics within the voice support line. This version is a neuro-generation (Claude + Qwen).
+# Голосовой сборщик корзины ВкусВилл
+
+Веб-приложение для голосового сбора корзины покупок во ВкусВилл с передачей оператору.
+
+## Возможности
+
+- Голосовое распознавание через Whisper (модель large-v3-turbo)
+- Поиск товаров через MCP-сервер ВкусВилла
+- Выбор товара из топ-3 при неоднозначном запросе
+- Фонетическая нормализация и fuzzy-поиск
+- TTS через edge-tts
+- Веб-интерфейс с отображением диалога и корзины
+
+## Требования
+
+- Python 3.10+
+- Микрофон
+- 8+ ГБ RAM (для модели large)
+- Доступ в интернет (загрузка моделей)
+
+## Установка
+
+```bash
+git clone <repo-url>
+cd MCP_VV
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# venv\Scripts\activate  # Windows
+pip install -r requirements.txt
+```
+
+## Настройка
+
+Опционально: установите HF_TOKEN для более быстрой загрузки моделей:
+
+```bash
+export HF_TOKEN="hf_ваш_токен"
+```
+
+Токен можно получить на huggingface.co в настройках.
+
+## Запуск
+
+```bash
+python app.py
+```
+
+Откройте в браузере: http://localhost:8000
+
+Нажмите "Начать звонок" и диктуйте товары.
+
+## Команды
+
+| Команда | Действие |
+|---------|----------|
+| Название товара | Поиск и добавление |
+| "первый", "второй", "третий" | Выбор из предложенных |
+| "да" | Подтверждение товара |
+| "нет" | Отмена |
+| "всё", "готово" | Передать корзину оператору |
+| "оператор" | Немедленная передача |
+
+## Конфигурация
+
+Основные параметры в app.py:
+
+| Параметр | Значение по умолчанию | Описание |
+|----------|----------------------|----------|
+| STT_MODEL | deepdml/faster-whisper-large-v3-turbo-ct2 | Модель распознавания |
+| VAD_THRESH | 350 | Порог голосовой активности |
+| SILENCE_SEC | 2.2 | Секунд тишины до конца фразы |
+| MAX_ITEMS | 5 | Максимум товаров до передачи оператору |
+
+## Структура
+
+```
+MCP_VV/
+├── app.py           # Основное приложение
+├── mcp_client.py    # Клиент MCP-сервера ВкусВилла
+├── requirements.txt # Зависимости
+└── README.md        # Документация
+```
+
+## Архитектура
+
+1. STT: faster-whisper (large-v3-turbo) с initial prompt и hotwords
+2. NLU: парсинг команд, извлечение количества, нормализация
+3. Поиск: MCP-сервер ВкусВилла
+4. TTS: edge-tts через pygame
+5. Web: FastAPI + WebSockets
+
+## Известные проблемы
+
+- Весовые товары требуют ручного подтверждения количества
+- Редкие галлюцинации Whisper остаются
+- MCP не поддерживает пустой поисковый запрос
+
+## Лицензия
+
+MIT
