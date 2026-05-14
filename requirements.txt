@@ -1,0 +1,10 @@
+faster-whisper
+edge-tts
+fastapi
+uvicorn
+sounddevice
+numpy
+pygame
+mcp
+httpx
+rapidfuzz
