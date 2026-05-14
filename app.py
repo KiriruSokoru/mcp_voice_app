@@ -1,5 +1,5 @@
 """
-app.py MVP v10 - АК-47 Франкенштейн ИИ
+app.py MVP v10 
 Три механизма защиты:
 1. Initial Prompt с топ-50 товаров
 2. Hotwords из MCP (топ-100)
@@ -239,7 +239,7 @@ def nlu(text: str) -> dict:
         if idx is not None and idx < len(S.pending_items):
             return {"intent": "select_item", "index": idx}
 
-    # АК-47: сначала fuzzy fix
+    # сначала fuzzy fix
     t = fuzzy_fix(t)
 
     qty, cleaned = _extract_qty_and_clean(t)
@@ -308,10 +308,10 @@ _HALLUCINATIONS = re.compile(
 )
 
 def transcribe(audio: np.ndarray) -> str:
-    # АК-47 деталь №1: initial prompt с топ-50 товаров
+    #  initial prompt с топ-50 товаров
     initial_prompt = f"Пользователь диктует список покупок в магазине. Товары: {', '.join(POPULAR_ITEMS[:30])}. Распознавай чётко названия продуктов."
     
-    # АК-47 деталь №2: hotwords из MCP
+    # hotwords из MCP
     hotwords_str = ", ".join(S.hotwords[:50]) if S.hotwords else ""
     
     segs, info = _whisper.transcribe(
