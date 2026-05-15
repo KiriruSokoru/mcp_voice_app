@@ -1,37 +1,43 @@
 """
-app.py MVP v10 
-Три механизма защиты:
-1. Initial Prompt с топ-50 товаров
-2. Hotwords из MCP (топ-100)
-3. Fuzzy-поиск по всему каталогу (rapidfuzz)
+app.py MVP v11 — Голосовой сборщик корзины для ВкусВилл
 """
-import asyncio, json, os, queue, re, tempfile, threading, time
+import asyncio, base64, hashlib, json, os, queue, re, tempfile, threading, time
+import soundfile as sf
 from typing import Dict, List, Optional
 
 import numpy as np
 import sounddevice as sd
 import edge_tts
-from faster_whisper import WhisperModel
+from kairos_asr import KairosASR
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import uvicorn
 from rapidfuzz import fuzz, process
 
 from mcp_client import VkusVillMCP
+from src.audio.rms_detector import RMSDetector, RMSConfig, AudioState
 
 # ── КОНФИГ ───────────────────────────────────────
 SAMPLE_RATE    = 16000
-VAD_THRESH     = 350
-SILENCE_SEC    = 2.2
-MIN_SAMPLES    = 16000
 POST_TTS_PAUSE = 0.5
 MAX_ITEMS      = 5
 MAX_ERRORS     = 2
 
-STT_MODEL = "deepdml/faster-whisper-large-v3-turbo-ct2"
-TTS_VOICE      = "ru-RU-SvetlanaNeural"
+TTS_VOICE = "ru-RU-SvetlanaNeural"
 
-# Топ-50 популярных товаров (hardcoded для initial prompt)
+DATASET_DIR = os.path.join(os.path.dirname(__file__), "datasets", "silence_samples")
+detector = RMSDetector(
+    RMSConfig(
+        speech_threshold=0.045,
+        silence_threshold=0.015,
+        silence_duration=1.2,
+        max_speech_duration=15.0,
+        min_speech_duration=0.3,
+        sample_rate=SAMPLE_RATE,
+    ),
+    dataset_dir=DATASET_DIR
+)
+
 POPULAR_ITEMS = [
     "молоко", "кефир", "творог", "сметана", "йогурт", "ряженка",
     "сыр", "масло сливочное", "масло оливковое", "сёмга", "форель",
@@ -43,8 +49,6 @@ POPULAR_ITEMS = [
     "апельсины", "мандарины", "виноград", "клубника", "малина"
 ]
 
-SILENT_NEEDED  = int(SILENCE_SEC / (512 / SAMPLE_RATE))
-
 def ts():   return time.strftime("%H:%M:%S")
 def log(m): print(f"[{ts()}] {m}", flush=True)
 
@@ -52,54 +56,87 @@ def log(m): print(f"[{ts()}] {m}", flush=True)
 try:
     import pygame
     pygame.mixer.init()
-except ImportError:
-    log("⚠️ pygame не установлен, TTS будет без звука")
+    TTS_AVAILABLE = True
+except Exception:
+    TTS_AVAILABLE = False
+    log("⚠️ Звук недоступен, TTS будет работать только текстом")
     class MockPygame:
-        mixer = type('obj', (object,), {'init': lambda: None, 'music': type('obj', (object,), {'load': lambda x: None, 'play': lambda: None, 'unload': lambda: None, 'get_busy': lambda: False})()})()
+        class _music:
+            @staticmethod
+            def load(path): pass
+            @staticmethod
+            def play(): pass
+            @staticmethod
+            def unload(): pass
+            @staticmethod
+            def get_busy(): return False
+        mixer = type('obj', (object,), {
+            'init': lambda: None,
+            'music': _music
+        })()
     pygame = MockPygame()
 
-is_speaking  = False
-_mic_blocked = False
 _tts_done    = threading.Event()
 _tts_done.set()
 _tts_q: queue.Queue = queue.Queue()
+_last_audio_hash = ""
 
 def _tts_worker():
-    global is_speaking, _mic_blocked
+    global _last_audio_hash
     loop = asyncio.new_event_loop()
 
     async def _speak(text: str):
+        global _last_audio_hash
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             tmp = f.name
         try:
+            # Mute микрофон ПЕРЕД синтезом
+            detector.mute_for_tts()
+            
             await edge_tts.Communicate(text, TTS_VOICE).save(tmp)
-            pygame.mixer.music.load(tmp)
-            pygame.mixer.music.play()
-            while pygame.mixer.music.get_busy():
-                await asyncio.sleep(0.05)
+            with open(tmp, 'rb') as af:
+                audio_bytes = af.read()
+            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+            audio_hash = hashlib.md5(audio_bytes).hexdigest()
+            if audio_hash != _last_audio_hash:
+                _last_audio_hash = audio_hash
+                try:
+                    _bcast_q.put_nowait(json.dumps({"audio": audio_b64}, ensure_ascii=False))
+                except asyncio.QueueFull:
+                    pass
+            if TTS_AVAILABLE:
+                pygame.mixer.music.load(tmp)
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    await asyncio.sleep(0.05)
         finally:
             try:
-                pygame.mixer.music.unload()
+                if TTS_AVAILABLE:
+                    pygame.mixer.music.unload()
                 os.unlink(tmp)
             except Exception:
                 pass
+            # Unmute ПОСЛЕ проигрывания + пауза
+            await asyncio.sleep(POST_TTS_PAUSE)
+            detector.unmute_after_tts()
+            # Слить аудио-мусор, накопившийся за время TTS
+            while not _audio_q.empty():
+                try:
+                    _audio_q.get_nowait()
+                except queue.Empty:
+                    break
 
     while True:
         text = _tts_q.get()
         if text is None:
             break
-        is_speaking = True
-        _mic_blocked = True
         _tts_done.clear()
         log(f"🔊 TTS → «{text}»")
         loop.run_until_complete(_speak(text))
-        is_speaking = False
-        time.sleep(POST_TTS_PAUSE)
-        _mic_blocked = False
         _tts_done.set()
 
 threading.Thread(target=_tts_worker, daemon=True).start()
-log(f"🗣 TTS голос: {TTS_VOICE}")
+log(f"🗣 TTS голос: {TTS_VOICE} (звук: {'да' if TTS_AVAILABLE else 'нет'})")
 
 # ── СОСТОЯНИЕ ────────────────────────────────────
 class Session:
@@ -114,8 +151,10 @@ class Session:
         self.pending: Optional[Dict] = None
         self.pending_items: Optional[List[Dict]] = None
         self.pending_query: Optional[str] = None
-        self.catalog: List[str] = []  # кэш названий товаров для fuzzy
-        self.hotwords: List[str] = []  # топ-100 для hotwords
+        self.catalog: List[str] = []
+        self.hotwords: List[str] = []
+        self.mic_level  = 0
+        self.mic_bar    = ""
     def __init__(self): self.reset()
 
 S   = Session()
@@ -126,8 +165,15 @@ _bcast_q:    asyncio.Queue   = asyncio.Queue()
 
 def push():
     data = json.dumps(
-        {"log": S.history, "cart": S.cart,
-         "status": S.status, "url": S.basket_url},
+        {
+            "log": S.history,
+            "cart": S.cart,
+            "status": S.status,
+            "url": S.basket_url,
+            "mic_level": S.mic_level,
+            "mic_bar": S.mic_bar,
+            "active": S.active
+        },
         ensure_ascii=False
     )
     try: _bcast_q.put_nowait(data)
@@ -142,14 +188,12 @@ def say(text: str, wait: bool = False):
 
 # ── ИНИЦИАЛИЗАЦИЯ КАТАЛОГА ───────────────────────
 async def init_catalog():
-    """Загружает каталог товаров и топ-100 для hotwords"""
-    log("📚 Загружаю популярные товары для fuzzy-поиска...")
-    # Пока используем hardcoded список, так как MCP не умеет в пустой запрос
+    log("📚 Загружаю каталог...")
     S.catalog = POPULAR_ITEMS.copy()
     S.hotwords = [item[:20] for item in POPULAR_ITEMS[:50]]
-    log(f"✅ Загружено {len(S.catalog)} товаров, {len(S.hotwords)} hotwords (hardcoded)")
+    log(f"✅ Каталог: {len(S.catalog)} товаров, {len(S.hotwords)} hotwords")
 
-# ── NLU (улучшенная) ─────────────────────────────
+# ── NLU ──────────────────────────────────────────
 _CONFIRM = re.compile(r'\b(да|верно|правильно|ок|окей|хорошо|подтверждаю|конечно|именно|точно|угу|ага)\b', re.I)
 _DONE    = re.compile(r'\b(всё|все|хватит|достаточно|готово|оформляй|оформите|заканчивай|больше ничего)\b', re.I)
 _OP      = re.compile(r'\b(оператор|человек|живой|менеджер|помогите|соедини|переключи|стоп)\b', re.I)
@@ -171,16 +215,13 @@ _STOP_WORDS = re.compile(
 )
 
 def fuzzy_fix(query: str) -> str:
-    """Находит ближайшее название товара в каталоге (АК-47 деталь №3)"""
     if not query or len(query) < 3 or not S.catalog:
         return query
-    
-    # Ищем с порогом 70%
     result = process.extractOne(query, S.catalog, scorer=fuzz.ratio, score_cutoff=70)
     if result:
         fixed, score = result
         if score > 80:
-            log(f"   🔧 Fuzzy замена: '{query}' → '{fixed}' (сходство {score}%)")
+            log(f"   🔧 Fuzzy: '{query}' → '{fixed}' ({score}%)")
             return fixed
     return query
 
@@ -203,14 +244,10 @@ def _build_search_query(text: str) -> str:
     q = _STOP_WORDS.sub(' ', text)
     q = re.sub(r'\s+', ' ', q).strip()
     return q
-    
+
 def normalize_query(query: str) -> str:
-    """Нормализует запрос перед отправкой в MCP"""
-    # 3,2% → 3.2% (MCP понимает точку, а не запятую)
     query = re.sub(r'(\d+),(\d+%)', r'\1.\2', query)
-    # Убираем слово "жирности" (оно избыточно)
     query = re.sub(r'\bжирности\b', '', query, flags=re.I)
-    # Убираем двойные пробелы
     query = re.sub(r'\s+', ' ', query).strip()
     return query
 
@@ -218,17 +255,13 @@ def extract_select_index(text: str) -> Optional[int]:
     m = _SELECT.search(text)
     if m:
         word = m.group(1).lower()
-        if word in ["первый", "1-й", "1"]:
-            return 0
-        if word in ["второй", "2-й", "2"]:
-            return 1
-        if word in ["третий", "3-й", "3"]:
-            return 2
+        if word in ["первый", "1-й", "1"]: return 0
+        if word in ["второй", "2-й", "2"]: return 1
+        if word in ["третий", "3-й", "3"]: return 2
     return None
 
 def nlu(text: str) -> dict:
     t = text.strip()
-
     if _OP.search(t):      return {"intent": "operator"}
     if _DONE.search(t):    return {"intent": "done"}
     if _CONFIRM.search(t): return {"intent": "confirm"}
@@ -239,13 +272,9 @@ def nlu(text: str) -> dict:
         if idx is not None and idx < len(S.pending_items):
             return {"intent": "select_item", "index": idx}
 
-    # сначала fuzzy fix
     t = fuzzy_fix(t)
-
     qty, cleaned = _extract_qty_and_clean(t)
     query = _build_search_query(cleaned)
-
-    log(f"   NLU: raw={t!r} → qty={qty} query={query!r}")
 
     if len(query) >= 2:
         is_single_word = len(query.split()) == 1
@@ -253,89 +282,105 @@ def nlu(text: str) -> dict:
     return {"intent": "unknown"}
 
 # ── АУДИО ────────────────────────────────────────
+def _find_mic():
+    try:
+        devices = sd.query_devices()
+        log(f"🎤 Найдено {len(devices)} устройств")
+        for i, dev in enumerate(devices):
+            if dev['max_input_channels'] > 0:
+                try:
+                    sd.check_input_settings(device=i, samplerate=SAMPLE_RATE, channels=1)
+                    log(f"   ✅ Микрофон [{i}]: {dev['name']}")
+                    return i
+                except sd.PortAudioError:
+                    continue
+        log("⚠️ Подходящий микрофон не найден")
+    except Exception as e:
+        log(f"⚠️ Ошибка сканирования: {e}")
+    return None
+
+MIC_DEVICE = _find_mic()
+
 def audio_capture(stop_ev: threading.Event):
-    buf, speaking, silent_chunks = [], False, 0
-
+    """Захват аудио через RMS-детектор."""
+    
     def cb(indata, frames, t, status):
-        nonlocal buf, speaking, silent_chunks
-        if _mic_blocked:
-            buf[:] = []; speaking = False; silent_chunks = 0
-            return
+        if status:
+            log(f"⚠️ audio status: {status}")
+        
+        # Обновляем уровень микрофона для UI
         vol = int(np.abs(indata.flatten()).mean())
-        if S.active:
-            bar = "█" * min(vol // 30, 30)
-            print(f"\r  mic {vol:4d} |{bar:<30}|  ", end="", flush=True)
-        if vol > VAD_THRESH:
-            if not speaking:
-                print(f"\n[{ts()}] 🎤 голос vol={vol}")
-            speaking = True; silent_chunks = 0
-            buf.extend(indata.flatten().tolist())
-        else:
-            if speaking:
-                buf.extend(indata.flatten().tolist())
-                silent_chunks += 1
-                if silent_chunks >= SILENT_NEEDED:
-                    n = len(buf)
-                    if n >= MIN_SAMPLES:
-                        arr = np.array(buf, dtype=np.int16).astype(np.float32) / 32768.0
-                        _audio_q.put(arr)
-                        print(f"\n[{ts()}] ✂️  фраза {n/SAMPLE_RATE:.2f}с → очередь")
-                    else:
-                        print(f"\n[{ts()}] ⚡ коротко ({n/SAMPLE_RATE:.2f}с), игнор")
-                    buf[:] = []; speaking = False; silent_chunks = 0
-
-    log("🎙 Микрофон запущен")
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                        dtype="int16", blocksize=512, callback=cb):
-        while not stop_ev.is_set():
-            time.sleep(0.05)
+        S.mic_level = vol
+        S.mic_bar = "█" * min(vol // 30, 30)
+        
+        # Пропускаем через RMS-детектор
+        result = detector.process_chunk(indata)
+        
+        if result is not None:
+            dur = len(result) / SAMPLE_RATE
+            S.history.append(f"🎤 запись {dur:.1f}с")
+            _audio_q.put(result)
+            log(f"✂️  фраза {dur:.2f}с → очередь")
+        
+        push()
+    
+    # Привязываем колбэк для ложных срабатываний
+    detector.on_false_trigger = lambda arr: log(
+        f"📊 Ложное срабатывание сохранено ({len(arr)/SAMPLE_RATE:.2f}с)"
+    )
+    
+    log(f"🎙 Микрофон запущен (device={MIC_DEVICE}, RMS-детектор)")
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                            dtype="int16", blocksize=512, callback=cb,
+                            device=MIC_DEVICE):
+            while not stop_ev.is_set():
+                time.sleep(0.05)
+    except Exception as e:
+        log(f"⚠️ Микрофон недоступен: {e}")
 
 # ── STT ──────────────────────────────────────────
-print(f"⏳ Загружаю Whisper ({STT_MODEL})...")
-_whisper = WhisperModel(
-    STT_MODEL, 
-    device="cpu", 
-    compute_type="int8",
-    cpu_threads=8,
-    num_workers=2
-)
-print("✅ Whisper готов")
-
 _HALLUCINATIONS = re.compile(
     r'^(спасибо|до свидания|пробки?|субтитры|подписывайтесь|продолжение следует'
-    r'|в этом видео|редактирование|\.+|-+|\s*)$',
+    r'|в этом видео|редактирование|субтитры создавал|играет музыка|музыка|'
+    r'\.+|-+|\s*)$',
     re.I
 )
 
+print("⏳ Загружаю GigaAM (kairos-asr)...")
+_asr = KairosASR()
+print("✅ GigaAM готов")
+
 def transcribe(audio: np.ndarray) -> str:
-    #  initial prompt с топ-50 товаров
-    initial_prompt = f"Пользователь диктует список покупок в магазине. Товары: {', '.join(POPULAR_ITEMS[:30])}. Распознавай чётко названия продуктов."
+    """Распознавание через GigaAM — без галлюцинаций, оптимизирован под русский."""
+    t0 = time.time()
     
-    # hotwords из MCP
-    hotwords_str = ", ".join(S.hotwords[:50]) if S.hotwords else ""
+    # Сохраняем аудио во временный WAV-файл (kairos-asr ожидает путь к файлу)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        tmp_path = f.name
+    try:
+        sf.write(tmp_path, audio, SAMPLE_RATE)
+        result = _asr.transcribe(tmp_path)
+        # kairos-asr возвращает объект TranscriptionResult с полем .text
+        text = result.full_text.strip().rstrip('.!?,;:')
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
     
-    segs, info = _whisper.transcribe(
-        audio,
-        beam_size=1,
-        language="ru",
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 500},
-        no_speech_threshold=0.6,
-        log_prob_threshold=-1.0,
-        compression_ratio_threshold=2.4,
-        initial_prompt=initial_prompt,
-        hotwords=hotwords_str if hotwords_str else None
-    )
-    parts = []
-    for seg in segs:
-        if seg.no_speech_prob > 0.6:
-            log(f"   STT: сегмент отброшен (no_speech_prob={seg.no_speech_prob:.2f}): {seg.text!r}")
-            continue
-        parts.append(seg.text.strip())
-    text = " ".join(parts).strip()
+    elapsed = time.time() - t0
+    log(f"🎯 GigaAM {elapsed:.1f}с: «{text}»")
+
+    if not text or len(text) < 2:
+        log(f"   STT: пустой результат")
+        return ""
 
     if _HALLUCINATIONS.match(text):
-        log(f"   STT: галлюцинация отброшена: {text!r}")
+        log(f"   STT: галлюцинация: {text!r}")
+        return ""
+    if re.search(r'субтитры|продолжение следует|играет музыка', text, re.I):
+        log(f"   STT: расширенная галлюцинация: {text!r}")
         return ""
     return text
 
@@ -363,20 +408,24 @@ async def show_top_choices(query: str, qty: int, results: List[Dict]):
     top_items = results[:3]
     S.pending_items = top_items
     S.pending_query = query
-    
+
     message = "Я нашёл несколько вариантов:\n"
     for i, item in enumerate(top_items, 1):
         price = item.get("price", {}).get("current", "?")
         message += f"{i}. {item['name']} — {price} руб.\n"
     message += "Какой добавить? Скажите «первый», «второй» или «третий»."
-    
+
     say(message, wait=True)
     S.status = "⏳ Жду выбора товара"
     push()
 
 # ── ГОЛОСОВОЙ ЦИКЛ ───────────────────────────────
-HINT_ADD  = "Называйте следующий товар."
-HINT_DONE = "Скажите «всё» когда закончите."
+HINT_SHORT = "Назовите товар"
+INTRO_FIRST = (
+    "Здравствуйте! Я помогу собрать корзину. "
+    "Называйте товары, например: «молоко», «хлеб», «творог». "
+    "Я буду уточнять детали. Когда закончите — скажите «всё»."
+)
 
 async def voice_loop():
     log("🔄 voice_loop запущен")
@@ -388,15 +437,35 @@ async def voice_loop():
             continue
 
         if not S.active:
+            while not _audio_q.empty():
+                try:
+                    _audio_q.get_nowait()
+                except queue.Empty:
+                    break
             continue
 
+        # Слить всё накопившееся, оставить только последнюю фразу
+        while not _audio_q.empty():
+            try:
+                audio = _audio_q.get_nowait()
+            except queue.Empty:
+                break
+
         await asyncio.to_thread(_tts_done.wait)
+
+        # Повторно слить — за время TTS микрофон насобирал мусор
+        while not _audio_q.empty():
+            try:
+                audio = _audio_q.get_nowait()
+            except queue.Empty:
+                break
 
         S.status = "⚙️ Распознаю..."
         push()
         t0   = time.time()
         text = await asyncio.to_thread(transcribe, audio)
-        log(f"📝 Whisper {time.time()-t0:.1f}с: «{text}»")
+        elapsed = time.time() - t0
+        log(f"📝 GigaAM {elapsed:.1f}с: «{text}»")
 
         if not text:
             S.status = "🎤 Слушаю..."
@@ -413,17 +482,17 @@ async def voice_loop():
             item = S.pending_items[idx]
             price = item.get("price", {}).get("current", "?")
             qty = 1
-            
+
             S.cart.append({"xml_id": int(item["xml_id"]), "name": item["name"],
                            "price": price, "qty": qty})
             S.pending_items = None
             S.pending_query = None
             S.errors = 0
-            
+
             if len(S.cart) >= MAX_ITEMS:
                 await do_handoff(f"Добавил {item['name']}. Набрали {MAX_ITEMS} позиций.")
             else:
-                say(f"Добавил {item['name']}. {HINT_ADD} {HINT_DONE}", wait=True)
+                say(f"Добавил {item['name']}. {HINT_SHORT}", wait=True)
                 S.status = "🎤 Слушаю..."
                 push()
             continue
@@ -438,14 +507,14 @@ async def voice_loop():
                 if len(S.cart) >= MAX_ITEMS:
                     await do_handoff(f"Добавил {item['name']}. Набрали {MAX_ITEMS} позиций.")
                 else:
-                    say(f"Добавил {item['name']}. {HINT_ADD} {HINT_DONE}", wait=True)
+                    say(f"Добавил {item['name']}. {HINT_SHORT}", wait=True)
                     S.status = "🎤 Слушаю..."; push()
                 continue
             if action == "deny":
                 S.pending = None
                 S.pending_items = None
                 S.errors = 0
-                say(f"Хорошо, отменил. {HINT_ADD}", wait=True)
+                say(f"Хорошо, отменил. {HINT_SHORT}", wait=True)
                 S.status = "🎤 Слушаю..."; push()
                 continue
             if action not in ("operator", "done"):
@@ -467,20 +536,19 @@ async def voice_loop():
 
         if action == "add_item":
             q, qty, is_single = intent["product"], intent["qty"], intent.get("single_word", False)
-            
-            # Нормализуем запрос перед отправкой
+
             q_normalized = normalize_query(q)
             if q_normalized != q:
                 log(f"   🔧 Нормализация: '{q}' → '{q_normalized}'")
                 q = q_normalized
-            
+
             S.status = f"🔍 Ищу «{q}»..."; push()
             log(f"🔍 MCP search: {q!r} qty={qty}")
             try:
                 results = await mcp.search(q)
             except Exception as e:
                 log(f"   MCP error: {e}"); results = []
-            
+
             log(f"   MCP нашёл {len(results)} товаров")
 
             if not results:
@@ -510,19 +578,23 @@ async def voice_loop():
         if S.errors >= MAX_ERRORS:
             await do_handoff("Не понимаю запрос, передаю оператору.")
         else:
-            say(f"Не понял. {HINT_ADD} {HINT_DONE}", wait=True)
+            say(f"Не понял. {HINT_SHORT}.", wait=True)
             S.status = "🎤 Слушаю..."; push()
 
 # ── FASTAPI ──────────────────────────────────────
 app = FastAPI()
 
-HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Ассистент v10 - АК-47</title>
+HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Голосовой ассистент ВкусВилл</title>
 <style>
-body{font-family:system-ui;max-width:960px;margin:0 auto;padding:1.5rem;background:#f0f2f5}
-.status{padding:10px 16px;border-radius:8px;background:#1565C0;color:#fff;font-weight:600;margin-bottom:1rem}
+*{box-sizing:border-box}
+body{font-family:system-ui;max-width:960px;margin:0 auto;padding:1rem;background:#f0f2f5}
+h2{margin:0 0 1rem;color:#333}
+.status{padding:10px 16px;border-radius:8px;background:#1565C0;color:#fff;font-weight:600;margin-bottom:0.5rem}
+.mic-bar{font-family:monospace;font-size:12px;padding:4px 16px;background:#263238;color:#4caf50;border-radius:4px;margin-bottom:1rem;min-height:24px}
 .btns{display:flex;gap:10px;margin-bottom:1rem;flex-wrap:wrap}
 button{padding:10px 22px;font-size:14px;font-weight:600;border:none;border-radius:7px;cursor:pointer}
 .go{background:#2e7d32;color:#fff}.op{background:#c62828;color:#fff}.rs{background:#546e7a;color:#fff}
+button:disabled{opacity:0.5;cursor:not-allowed}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
 .box{background:#fff;border-radius:10px;padding:14px;border:1px solid #ddd}
 .box h3{font-size:12px;text-transform:uppercase;color:#888;margin:0 0 10px}
@@ -534,17 +606,22 @@ button{padding:10px 22px;font-size:14px;font-weight:600;border:none;border-radiu
 .empty{color:#bbb;font-style:italic;font-size:13px}
 .hint{background:#fff8e1;border-left:3px solid #f9a825;padding:10px 14px;border-radius:4px;font-size:13px;margin-bottom:1rem;line-height:1.8}
 </style></head><body>
-<h2>🎙 Ассистент v10 — АК-47 Франкенштейн ИИ</h2>
+<h2>🎙 Голосовой сборщик корзины</h2>
 <div class="hint">
   <b>«да»</b> — подтвердить &nbsp;·&nbsp;
   <b>«нет»</b> — отменить &nbsp;·&nbsp;
-  <b>«первый/второй/третий»</b> — выбрать из предложенных &nbsp;·&nbsp;
+  <b>«первый/второй/третий»</b> — выбрать &nbsp;·&nbsp;
   <b>«всё»</b> / <b>«готово»</b> — передать оператору &nbsp;·&nbsp;
-  <b>«оператор»</b> — передать немедленно
+  <b>«оператор»</b> — оператор немедленно
 </div>
 <div class="status" id="st">⏸ Ожидание</div>
+<div class="mic-bar" id="mic">
+  <span id="mic-icon">⏸️</span>
+  <span id="mic-text">Микрофон не активен</span>
+  <span id="mic-level"></span>
+</div>
 <div class="btns">
-  <button class="go" onclick="cmd('start')">▶ Начать звонок</button>
+  <button class="go" id="btnStart" onclick="cmd('start')">▶ Начать звонок</button>
   <button class="op" onclick="cmd('handoff')">📞 Передать оператору</button>
   <button class="rs" onclick="cmd('reset')">↺ Сброс</button>
 </div>
@@ -562,11 +639,43 @@ button{padding:10px 22px;font-size:14px;font-weight:600;border:none;border-radiu
 const ws=new WebSocket(`ws://${location.host}/ws`);
 ws.onmessage=({data})=>{
   const d=JSON.parse(data);
+  // Воспроизводим аудио, если пришло
+  if(d.audio){
+    const audio=new Audio('data:audio/mp3;base64,'+d.audio);
+    audio.play().catch(e=>console.log('Audio play failed:',e));
+  }
   document.getElementById('st').textContent=d.status;
+  const micIcon = document.getElementById('mic-icon');
+  const micText = document.getElementById('mic-text');
+  const micLevel = document.getElementById('mic-level');
+
+  if (d.active) {
+    if (d.status.includes('Слушаю')) {
+      micIcon.textContent = '🎤';
+      micText.textContent = 'Слушаю...';
+    } else if (d.status.includes('Распознаю') || d.status.includes('Ищу')) {
+      micIcon.textContent = '🧠';
+      micText.textContent = 'Обрабатываю...';
+    } else if (d.status.includes('Жду')) {
+      micIcon.textContent = '⏳';
+      micText.textContent = d.status;
+    } else {
+      micIcon.textContent = '🔊';
+      micText.textContent = 'Отвечаю...';
+    }
+    micLevel.textContent = d.mic_bar || '';
+  } else {
+    micIcon.textContent = '⏸️';
+    micText.textContent = 'Микрофон не активен';
+    micLevel.textContent = '';
+  }
+  const btn=document.getElementById('btnStart');
+  if(d.active){btn.textContent='🛑 Завершить';btn.className='op';btn.onclick=()=>cmd('handoff')}
+  else{btn.textContent='▶ Начать звонок';btn.className='go';btn.onclick=()=>cmd('start')}
   const lg=document.getElementById('log');
   lg.innerHTML=d.log.length
-    ?d.log.map(l=>`<div class="${l.startsWith('🤖')?'bot':l.startsWith('👤')?'usr':'lnk'}">${l}</div>`).join('')
-    :'<p class="empty">Нажмите «Начать звонок»</p>';
+    ?d.log.map(l=>`<div class="${l.startsWith('🤖')?'bot':l.startsWith('👤')?'usr':l.startsWith('🎤')?'lnk':'lnk'}">${l}</div>`).join('')
+    :'<p class="empty">Ожидание...</p>';
   lg.scrollTop=lg.scrollHeight;
   let total=0;
   document.getElementById('cart').innerHTML=d.cart.length
@@ -595,9 +704,10 @@ async def ws_ep(ws: WebSocket):
             a = msg.get("action")
             if a == "start":
                 S.reset()
+                detector.force_reset()   # <-- ДОБАВИТЬ эту строку
                 S.active = True; S.start_ts = time.time()
                 S.status = "🎤 Слушаю клиента..."; push()
-                say("Здравствуйте! Называйте товары по одному. Когда закончите — скажите «всё».")
+                say(INTRO_FIRST)
             elif a == "handoff":
                 await do_handoff("Оператор подключается.")
             elif a == "reset":
@@ -619,14 +729,13 @@ def _run_uvicorn():
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
 
 async def main():
-    # Загружаем каталог перед стартом
     await init_catalog()
-    
+
     threading.Thread(target=_run_uvicorn, daemon=True).start()
     stop_ev = threading.Event()
     threading.Thread(target=audio_capture, args=(stop_ev,), daemon=True).start()
     asyncio.create_task(_ws_sender())
-    log(f"🌐 http://localhost:8000  VAD={VAD_THRESH}  silence={SILENCE_SEC}s")
+    log(f"🌐 http://localhost:8000  RMS-threshold={detector.config.speech_threshold}  silence={detector.config.silence_duration}s")
     await voice_loop()
 
 if __name__ == "__main__":

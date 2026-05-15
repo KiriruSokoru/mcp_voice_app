@@ -8,3 +8,6 @@ pygame
 mcp
 httpx
 rapidfuzz
+structlog
+kairos-asr
+soundfile
