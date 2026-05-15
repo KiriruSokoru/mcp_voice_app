@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+*.egg-info/
+*.tar
+.vscode/
+.idea/
+k8s/secret.yaml
+*.bin
+*.safetensors
+.DS_Store
+Thumbs.db

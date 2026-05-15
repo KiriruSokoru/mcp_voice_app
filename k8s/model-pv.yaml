@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: whisper-model-pvc
+  namespace: mcp-vv
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: whisper-model-loader
+  namespace: mcp-vv
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: downloader
+          image: python:3.11-slim
+          command:
+            - sh
+            - -c
+            - |
+              pip install --quiet huggingface_hub
+              python -c "
+              from huggingface_hub import snapshot_download
+              import os
+              model_path = '/models/whisper'
+              if not os.path.exists(model_path) or not os.listdir(model_path):
+                  print('Downloading Whisper model...')
+                  snapshot_download(
+                      repo_id='deepdml/faster-whisper-large-v3-turbo-ct2',
+                      local_dir=model_path,
+                      local_dir_use_symlinks=False,
+                      token=os.environ.get('HF_TOKEN')
+                  )
+                  print('Done')
+              else:
+                  print('Already exists')
+              "
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: whisper-model-pvc

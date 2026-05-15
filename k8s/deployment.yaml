@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: assistant
+  namespace: mcp-vv
+  labels:
+    app: assistant
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: assistant
+  template:
+    metadata:
+      labels:
+        app: assistant
+    spec:
+      containers:
+        - name: assistant
+          image: registry.mcp-vv.svc.cluster.local:5000/mcp-vv:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: WHISPER_MODEL_PATH
+              value: "/models/whisper"
+            - name: ALSA_CARD
+              value: "0"
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+              readOnly: true
+            - name: audio-device
+              mountPath: /dev/snd
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 45
+            periodSeconds: 10
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: whisper-model-pvc
+        - name: audio-device
+          hostPath:
+            path: /dev/snd
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: assistant
+  namespace: mcp-vv
+  labels:
+    app: assistant
+spec:
+  selector:
+    app: assistant
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+      name: http
