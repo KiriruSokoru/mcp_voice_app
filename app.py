@@ -49,6 +49,23 @@ POPULAR_ITEMS = [
     "апельсины", "мандарины", "виноград", "клубника", "малина"
 ]
 
+# Топ покупаемых товаров (Росстат, продовольственная корзина 2026)
+TOP_ITEMS = [
+    "говядина", "свинина", "курица", "индейка", "баранина", "печень",
+    "колбаса", "сосиски", "сардельки",
+    "рыба", "форель", "семга", "горбуша", "сельдь",
+    "молоко", "творог", "кефир", "сметана", "ряженка", "йогурт",
+    "сыр", "масло сливочное", "масло растительное",
+    "яйца",
+    "хлеб", "батон", "хлеб ржаной",
+    "гречка", "рис", "пшено", "макароны", "спагетти", "мука",
+    "картофель", "лук", "морковь", "капуста", "свекла",
+    "помидоры", "огурцы",
+    "яблоки", "бананы", "апельсины", "лимоны",
+    "сахар", "соль", "чай", "кофе", "печенье",
+    "вода", "сок", "лимонад", "квас",
+]
+
 def ts():   return time.strftime("%H:%M:%S")
 def log(m): print(f"[{ts()}] {m}", flush=True)
 
@@ -181,23 +198,33 @@ def push():
 
 def say(text: str, wait: bool = False):
     S.history.append(f"🤖 {text}")
-    _tts_q.put(text)
+    _tts_q.put(normalize_for_tts(text))
     push()
     if wait:
         _tts_done.wait()
 
 # ── ИНИЦИАЛИЗАЦИЯ КАТАЛОГА ───────────────────────
 async def init_catalog():
-    log("📚 Загружаю каталог...")
-    S.catalog = POPULAR_ITEMS.copy()
-    S.hotwords = [item[:20] for item in POPULAR_ITEMS[:50]]
-    log(f"✅ Каталог: {len(S.catalog)} товаров, {len(S.hotwords)} hotwords")
+    log("📚 Загружаю каталог из MCP по топовым товарам...")
+    catalog_set = set(POPULAR_ITEMS)
+    
+    for query in TOP_ITEMS:
+        try:
+            results = await mcp.search(query)
+            for item in results:
+                catalog_set.add(item["name"].lower())
+        except Exception as e:
+            log(f"   '{query}': ошибка ({e})")
+    
+    S.catalog = list(catalog_set)
+    S.hotwords = [item[:20] for item in S.catalog[:100]]
+    log(f"✅ Каталог: {len(S.catalog)} товаров (из {len(TOP_ITEMS)} топ-запросов)")
 
 # ── NLU ──────────────────────────────────────────
 _CONFIRM = re.compile(r'\b(да|верно|правильно|ок|окей|хорошо|подтверждаю|конечно|именно|точно|угу|ага)\b', re.I)
 _DONE    = re.compile(r'\b(всё|все|хватит|достаточно|готово|оформляй|оформите|заканчивай|больше ничего)\b', re.I)
 _OP      = re.compile(r'\b(оператор|человек|живой|менеджер|помогите|соедини|переключи|стоп)\b', re.I)
-_DENY    = re.compile(r'\b(нет|не верно|неверно|не то|другой|другое|не тот|не та)\b', re.I)
+_DENY    = re.compile(r'\b(нет|не верно|неверно|не то|другой|другое|не тот|не та|не надо|не нужно|не хочу)\b', re.I)
 _SELECT  = re.compile(r'\b(первый|второй|третий|1-й|2-й|3-й|1|2|3)\b', re.I)
 
 _QTY_WORDS = {
@@ -247,8 +274,12 @@ def _build_search_query(text: str) -> str:
 
 def normalize_query(query: str) -> str:
     query = re.sub(r'(\d+),(\d+%)', r'\1.\2', query)
-    query = re.sub(r'\bжирности\b', '', query, flags=re.I)
+    # Не удаляем "жирности" — это важное слово для поиска
     query = re.sub(r'\s+', ' ', query).strip()
+    # Исправляем S1 → С1 (яйца)
+    query = re.sub(r'\bS1\b', 'С1', query, flags=re.I)
+    query = re.sub(r'\bS2\b', 'С2', query, flags=re.I)
+    query = re.sub(r'\bS0\b', 'С0', query, flags=re.I)
     return query
 
 def extract_select_index(text: str) -> Optional[int]:
@@ -280,6 +311,24 @@ def nlu(text: str) -> dict:
         is_single_word = len(query.split()) == 1
         return {"intent": "add_item", "product": query, "qty": qty, "single_word": is_single_word}
     return {"intent": "unknown"}
+
+# ── Нормализация для TTS ─────────────────────────
+_TTS_NORMALIZE = [
+    (re.compile(r'\b(\d+)\s*г(?:\b|рамм)'), r'\1 грамм'),  # не трогаем "грамм" если уже есть
+    (re.compile(r'\b(\d+)\s*кг(?:\b|илограмм)'), r'\1 килограмм'),
+    (re.compile(r'\b(\d+)\s*мл(?:\b|иллилитр)'), r'\1 миллилитров'),
+    (re.compile(r'\b(\d+)\s*л(?:\b|итр)'), r'\1 литр'),
+    (re.compile(r'\b(\d+)\s*см(?:\b|антиметр)'), r'\1 сантиметр'),
+    (re.compile(r'\b(\d+)\s*шт(?:\b|тук)'), r'\1 штук'),
+    (re.compile(r'(\d+),(\d+)\s*%'), r'\1.\2 процента'),
+    (re.compile(r'(\d+)\s*%'), r'\1 процент'),
+    (re.compile(r'ул\.?\s*'), 'улица '),
+]
+
+def normalize_for_tts(text: str) -> str:
+    for pattern, replacement in _TTS_NORMALIZE:
+        text = pattern.sub(replacement, text)
+    return text
 
 # ── АУДИО ────────────────────────────────────────
 def _find_mic():
@@ -471,6 +520,19 @@ async def voice_loop():
             S.status = "🎤 Слушаю..."
             push()
             continue
+
+        # Контекстная коррекция команд подтверждения/отмены
+        if S.pending or S.pending_items:
+            text_lower = text.lower().strip()
+            # "перно", "верна", "верн" → "верно"
+            if len(text_lower) <= 6 and text_lower not in ("да", "нет", "всё", "все",
+                "первый", "второй", "третий", "верно", "хорошо", "готово", "оператор"):
+                if re.match(r'^[вп][еи]?р[нм]', text_lower):
+                    log(f"   🔧 Контекст: '{text}' → 'верно'")
+                    text = "верно"
+                elif re.match(r'^н[еиа]', text_lower) and len(text_lower) <= 4:
+                    log(f"   🔧 Контекст: '{text}' → 'нет'")
+                    text = "нет"
 
         S.history.append(f"👤 {text}")
         intent = nlu(text)
