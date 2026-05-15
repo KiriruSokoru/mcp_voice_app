@@ -23,14 +23,9 @@ spec:
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
-            - name: WHISPER_MODEL_PATH
-              value: "/models/whisper"
             - name: ALSA_CARD
               value: "0"
           volumeMounts:
-            - name: model-storage
-              mountPath: /models
-              readOnly: true
             - name: audio-device
               mountPath: /dev/snd
           securityContext:
@@ -49,9 +44,6 @@ spec:
             initialDelaySeconds: 45
             periodSeconds: 10
       volumes:
-        - name: model-storage
-          persistentVolumeClaim:
-            claimName: whisper-model-pvc
         - name: audio-device
           hostPath:
             path: /dev/snd
