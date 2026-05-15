@@ -1,13 +1,12 @@
-faster-whisper
-edge-tts
 fastapi
 uvicorn
 sounddevice
 numpy
 pygame
-mcp
-httpx
+edge-tts
 rapidfuzz
-structlog
+httpx
+mcp
 kairos-asr
 soundfile
+structlog
